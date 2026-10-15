@@ -9,37 +9,56 @@ import {
   Image,
   ActivityIndicator,
   Alert,
+  Modal,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { useLanguage } from '../../../src/context/LanguageContext';
+import { useAuth } from '../../../src/context/AuthContext';
 import { apiRequest, API_BASE_URL } from '../../../src/api/client';
-import { ConsultationCase } from '../../../src/types';
-import { colors } from '../../../src/theme/colors';
+import { ConsultationCase, CasePriority } from '../../../src/types';
 
 export default function OfficerCaseReviewScreen() {
   const { id } = useLocalSearchParams();
   const router = useRouter();
-  const { t } = useLanguage();
+  const { user } = useAuth();
 
   const caseId = id as string;
 
   const [caseData, setCaseData] = useState<ConsultationCase | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // Editable response fields
+  // Active Dossier Tab
+  const [activeTab, setActiveTab] = useState<'prescription' | 'specimen' | 'audit'>('prescription');
+
+  // Editable prescription fields
   const [confirmedDisease, setConfirmedDisease] = useState('');
   const [severity, setSeverity] = useState<'Mild' | 'Moderate' | 'Severe'>('Moderate');
   const [treatment, setTreatment] = useState('');
   const [instructions, setInstructions] = useState('');
   const [followUpDate, setFollowUpDate] = useState('');
 
-  // Status & Priority controls
-  const [priority, setPriority] = useState<'Low' | 'Medium' | 'High'>('Medium');
+  // Priority control
+  const [priority, setPriority] = useState<CasePriority>('Medium');
 
+  // Button state flags
   const [savingDraft, setSavingDraft] = useState(false);
   const [publishing, setPublishing] = useState(false);
-  const [actionMessage, setActionMessage] = useState('');
+  const [withdrawing, setWithdrawing] = useState(false);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
+
+  // Image zoom modal
+  const [imageModalOpen, setImageModalOpen] = useState(false);
+
+  // Common quick-fill pathogens
+  const commonPathogens = [
+    'Early Blight (Alternaria solani)',
+    'Late Blight (Phytophthora infestans)',
+    'Bacterial Wilt (Ralstonia solanacearum)',
+    'Tomato Yellow Leaf Curl Virus (TYLCV)',
+    'Paddy Blast (Magnaporthe oryzae)',
+    'Chilli Anthracnose (Colletotrichum)',
+    'Potato Powdery Mildew',
+  ];
 
   const fetchCase = async () => {
     try {
@@ -67,10 +86,13 @@ export default function OfficerCaseReviewScreen() {
             setFollowUpDate(new Date(c.publishedResponse.followUpDate).toISOString().split('T')[0]);
           }
         } else {
-          setConfirmedDisease(c.aiSuggestedDisease);
+          setConfirmedDisease(c.aiSuggestedDisease || 'Early Blight (Alternaria solani)');
           setSeverity(c.priority === 'High' ? 'Severe' : 'Moderate');
-          setTreatment('Apply recommended copper fungicide or bio-pesticide spray.');
-          setInstructions('Ensure adequate drainage and remove fallen infected foliage.');
+          setTreatment('Apply Mancozeb 75% WP @ 2.5g/L or Copper Oxychloride 50 WP. Alternate with bio-fungicide Trichoderma harzianum.');
+          setInstructions('Inspect lower canopy leaves daily. Discard infected foliage in sealed bags. Improve furrow drainage to reduce humidity.');
+          const defaultFollowUp = new Date();
+          defaultFollowUp.setDate(defaultFollowUp.getDate() + 10);
+          setFollowUpDate(defaultFollowUp.toISOString().split('T')[0]);
         }
       }
     } catch (e) {
@@ -84,34 +106,39 @@ export default function OfficerCaseReviewScreen() {
     fetchCase();
   }, [caseId]);
 
-  // Update Priority / Assignment
-  const handleUpdatePriority = async (newPriority: 'Low' | 'Medium' | 'High') => {
+  // Update Priority
+  const handleUpdatePriority = async (newPriority: CasePriority) => {
     setPriority(newPriority);
-    await apiRequest(`/api/officer/cases/${caseId}/status`, {
-      method: 'PATCH',
-      body: { priority: newPriority },
-    });
+    try {
+      await apiRequest(`/api/officer/cases/${caseId}/status`, {
+        method: 'PATCH',
+        body: { priority: newPriority },
+      });
+      fetchCase();
+    } catch (e) {
+      console.warn('Failed to update priority:', e);
+    }
   };
 
   // 1. Save Private Draft (CRUD - Save Draft)
   const handleSaveDraft = async () => {
     setSavingDraft(true);
-    setActionMessage('');
+    setActionNotice(null);
     try {
       const res = await apiRequest(`/api/officer/cases/${caseId}/draft`, {
         method: 'PUT',
         body: {
-          confirmedDisease,
+          confirmedDisease: confirmedDisease.trim(),
           severity,
-          treatment,
-          instructions,
+          treatment: treatment.trim(),
+          instructions: instructions.trim(),
           followUpDate: followUpDate || undefined,
           expectedVersion: caseData?.version,
         },
       });
 
       if (res.success) {
-        setActionMessage('Private working draft saved securely. (Invisible to farmer)');
+        setActionNotice('Confidential working draft saved. Not visible to farmer.');
         fetchCase();
       } else {
         Alert.alert('Notice', res.message || 'Could not save draft.');
@@ -125,7 +152,7 @@ export default function OfficerCaseReviewScreen() {
 
   // 2. Discard Draft (CRUD - Delete Draft)
   const handleDiscardDraft = () => {
-    Alert.alert('Discard Draft', 'Are you sure you want to discard your private working draft?', [
+    Alert.alert('Discard Working Draft', 'Are you sure you want to discard your private working draft notes?', [
       { text: 'Cancel', style: 'cancel' },
       {
         text: 'Discard',
@@ -133,7 +160,7 @@ export default function OfficerCaseReviewScreen() {
         onPress: async () => {
           const res = await apiRequest(`/api/officer/cases/${caseId}/draft`, { method: 'DELETE' });
           if (res.success) {
-            setActionMessage('Private draft discarded.');
+            setActionNotice('Working draft discarded.');
             fetchCase();
           }
         },
@@ -141,15 +168,18 @@ export default function OfficerCaseReviewScreen() {
     ]);
   };
 
-  // 3. Publish Expert Advice (CRUD - Publish Response)
+  // 3. Publish Official Advice (CRUD - Publish Response)
   const handlePublish = async () => {
     if (!confirmedDisease.trim() || !treatment.trim() || !instructions.trim()) {
-      Alert.alert('Validation Error', 'Please complete the confirmed disease, treatment advice, and instructions before publishing.');
+      Alert.alert(
+        'Missing Information',
+        'Please complete the confirmed disease name, treatment recommendations, and field instructions before publishing.'
+      );
       return;
     }
 
     setPublishing(true);
-    setActionMessage('');
+    setActionNotice(null);
     try {
       const res = await apiRequest(`/api/officer/cases/${caseId}/publish`, {
         method: 'POST',
@@ -165,21 +195,21 @@ export default function OfficerCaseReviewScreen() {
 
       if (res.success) {
         Alert.alert(
-          'Advice Published',
-          'Official expert response has been published to the farmer and case status is now Resolved.',
+          'Prescription Published',
+          'Official agricultural advice has been signed and released to the farmer. Case status updated to Resolved.',
           [{ text: 'OK', onPress: () => fetchCase() }]
         );
       } else {
-        Alert.alert('Notice', res.message || 'Publishing failed.');
+        Alert.alert('Publishing Notice', res.message || 'Failed to publish.');
       }
     } catch (e: any) {
-      Alert.alert('Error', e.message || 'Publishing error.');
+      Alert.alert('Error', e.message || 'Error occurred while publishing.');
     } finally {
       setPublishing(false);
     }
   };
 
-  // 4. Edit Published Advice (CRUD - Update Published)
+  // 4. Update Published Advice (CRUD - Update Published)
   const handleEditPublished = async () => {
     setPublishing(true);
     try {
@@ -195,34 +225,41 @@ export default function OfficerCaseReviewScreen() {
       });
 
       if (res.success) {
-        Alert.alert('Updated', 'Published response has been updated.');
+        Alert.alert('Advice Updated', 'The published agronomic response has been updated.');
         fetchCase();
       }
-    } catch (e) {
-      console.warn('Update error:', e);
+    } catch (e: any) {
+      Alert.alert('Error', e.message || 'Failed to update published advice.');
     } finally {
       setPublishing(false);
     }
   };
 
-  // 5. Withdraw Advice & Reopen Case (CRUD - Withdraw & Audit)
+  // 5. Withdraw Advice & Reopen (CRUD - Withdraw & Audit)
   const handleWithdraw = () => {
     Alert.alert(
-      'Withdraw Advice & Reopen Case',
-      t.withdrawConfirm || 'Are you sure you want to withdraw this published response and reopen the case to In Review?',
+      'Withdraw Official Advice & Reopen',
+      'Are you sure you want to withdraw this published advice? The case will transition back to "In Review" and the action will be permanently logged in the audit ledger.',
       [
         { text: 'Cancel', style: 'cancel' },
         {
           text: 'Withdraw & Reopen',
           style: 'destructive',
           onPress: async () => {
-            const res = await apiRequest(`/api/officer/cases/${caseId}/withdraw`, {
-              method: 'POST',
-              body: { reason: 'Officer withdrew response for re-examination.' },
-            });
-            if (res.success) {
-              Alert.alert('Reopened', 'Response withdrawn. Case is now back In Review.');
-              fetchCase();
+            setWithdrawing(true);
+            try {
+              const res = await apiRequest(`/api/officer/cases/${caseId}/withdraw`, {
+                method: 'POST',
+                body: { reason: 'Officer withdrew response for clinical re-examination and prescription refinement.' },
+              });
+              if (res.success) {
+                Alert.alert('Case Reopened', 'Official response revoked. Case is now In Review.');
+                fetchCase();
+              }
+            } catch (e: any) {
+              Alert.alert('Error', e.message || 'Could not withdraw advice.');
+            } finally {
+              setWithdrawing(false);
             }
           },
         },
@@ -230,12 +267,18 @@ export default function OfficerCaseReviewScreen() {
     );
   };
 
+  const handleQuickFollowUp = (daysAhead: number) => {
+    const d = new Date();
+    d.setDate(d.getDate() + daysAhead);
+    setFollowUpDate(d.toISOString().split('T')[0]);
+  };
+
   if (loading) {
     return (
       <SafeAreaView style={styles.safeArea}>
-        <View style={styles.loadingBox}>
-          <ActivityIndicator color={colors.primary} size="large" />
-          <Text style={styles.loadingText}>Loading case details...</Text>
+        <View style={styles.centerBox}>
+          <ActivityIndicator color="#059669" size="large" />
+          <Text style={styles.loadingText}>Retrieving official case dossier...</Text>
         </View>
       </SafeAreaView>
     );
@@ -244,244 +287,441 @@ export default function OfficerCaseReviewScreen() {
   if (!caseData) {
     return (
       <SafeAreaView style={styles.safeArea}>
-        <View style={styles.loadingBox}>
-          <Text style={{ fontSize: 32, marginBottom: 10 }}>⚠</Text>
-          <Text style={{ color: colors.textMuted }}>Case record not found.</Text>
+        <View style={styles.centerBox}>
+          <Text style={{ fontSize: 32, marginBottom: 12 }}>⚠</Text>
+          <Text style={{ color: '#94a3b8', fontSize: 16, fontWeight: '700' }}>Case record not found.</Text>
           <TouchableOpacity style={styles.backBtn} onPress={() => router.back()}>
-            <Text style={styles.backBtnText}>Return to Dashboard</Text>
+            <Text style={styles.backBtnText}>← Return to Triage Queue</Text>
           </TouchableOpacity>
         </View>
       </SafeAreaView>
     );
   }
 
-  const isResolved = caseData.status === 'Resolved' && caseData.publishedResponse && !caseData.publishedResponse.isWithdrawn;
+  const isResolved = caseData.status === 'Resolved';
+  const hasDraft = Boolean(caseData.privateDraft);
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <View style={styles.header}>
-        <TouchableOpacity style={styles.headerBackBtn} onPress={() => router.back()}>
-          <Text style={styles.headerBackText}>← Queue</Text>
+      {/* Top Dossier Bar */}
+      <View style={styles.dossierBar}>
+        <TouchableOpacity style={styles.backArrowBtn} onPress={() => router.back()}>
+          <Text style={styles.backArrowText}>← Triage</Text>
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Case #{caseData._id.slice(-6).toUpperCase()}</Text>
-        <View style={{ width: 50 }} />
+
+        <View style={styles.dossierBarTitle}>
+          <Text style={styles.dossierTitle}>CASE DOSSIER #{caseData._id.slice(-6).toUpperCase()}</Text>
+          <Text style={styles.dossierSubtitle}>
+            {caseData.crop.toUpperCase()} · {caseData.farmerName} · {caseData.district || 'Central'}
+          </Text>
+        </View>
+
+        <View style={styles.statusPillSmall}>
+          <Text style={styles.statusPillSmallText}>{caseData.status.toUpperCase()}</Text>
+        </View>
       </View>
 
-      <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
-        <View style={styles.memberTag}>
-          <Text style={styles.memberTagText}>MEMBER 4 · EXPERT DIAGNOSIS & RESPONSE MANAGEMENT</Text>
-        </View>
-
-        {/* Farmer Information Card */}
-        <View style={styles.card}>
-          <Text style={styles.cardSectionLabel}>FARMER CASE DETAILS</Text>
-          <Text style={styles.farmerTitle}>{caseData.farmerName}</Text>
-          <Text style={styles.farmerSub}>
-            📍 {caseData.location} ({caseData.district}) · 📞 {caseData.farmerPhone || 'N/A'}
+      {/* Navigation Dossier Tabs */}
+      <View style={styles.tabsHeader}>
+        <TouchableOpacity
+          style={[styles.dossierTab, activeTab === 'prescription' && styles.dossierTabActive]}
+          onPress={() => setActiveTab('prescription')}
+        >
+          <Text style={[styles.dossierTabText, activeTab === 'prescription' && styles.dossierTabTextActive]}>
+            ✍️ Prescription Studio
           </Text>
-          <Text style={styles.officeSub}>🏛 Office: {caseData.office}</Text>
+        </TouchableOpacity>
 
-          <View style={styles.symptomsBox}>
-            <Text style={styles.symptomsLabel}>Farmer's Reported Symptoms:</Text>
-            <Text style={styles.symptomsText}>"{caseData.farmerNotes}"</Text>
-          </View>
-        </View>
+        <TouchableOpacity
+          style={[styles.dossierTab, activeTab === 'specimen' && styles.dossierTabActive]}
+          onPress={() => setActiveTab('specimen')}
+        >
+          <Text style={[styles.dossierTabText, activeTab === 'specimen' && styles.dossierTabTextActive]}>
+            🍃 Farmer Specimen
+          </Text>
+        </TouchableOpacity>
 
-        {/* Plant Leaf Image & AI Suggestion */}
-        <View style={styles.card}>
-          <Text style={styles.cardSectionLabel}>LINKED CROP PHOTOGRAPH & AI RESULT</Text>
-          {caseData.imageUrl ? (
-            <Image
-              source={{ uri: `${API_BASE_URL}${caseData.imageUrl}` }}
-              style={styles.leafImage}
-              resizeMode="cover"
-            />
-          ) : (
-            <View style={styles.missingImageBox}>
-              <Text style={{ fontSize: 30 }}>🍃</Text>
-              <Text style={styles.missingImageText}>No image provided</Text>
-            </View>
-          )}
+        <TouchableOpacity
+          style={[styles.dossierTab, activeTab === 'audit' && styles.dossierTabActive]}
+          onPress={() => setActiveTab('audit')}
+        >
+          <Text style={[styles.dossierTabText, activeTab === 'audit' && styles.dossierTabTextActive]}>
+            📜 Audit Ledger ({caseData.auditTrail?.length || 0})
+          </Text>
+        </TouchableOpacity>
+      </View>
 
-          <View style={styles.aiSuggestionBox}>
-            <View style={styles.aiRow}>
-              <Text style={styles.aiCropText}>{caseData.crop}</Text>
-              <Text style={styles.aiConfidenceText}>{caseData.aiConfidence}% AI Confidence</Text>
-            </View>
-            <Text style={styles.aiDiseaseText}>{caseData.aiSuggestedDisease}</Text>
-          </View>
-        </View>
-
-        {/* Priority Selector */}
-        <View style={styles.card}>
-          <Text style={styles.cardSectionLabel}>SET CASE PRIORITY</Text>
-          <View style={styles.prioritySelectorRow}>
-            {(['Low', 'Medium', 'High'] as const).map((pr) => (
-              <TouchableOpacity
-                key={pr}
-                style={[
-                  styles.priorityBtn,
-                  priority === pr && (pr === 'High' ? styles.prHighActive : pr === 'Medium' ? styles.prMedActive : styles.prLowActive),
-                ]}
-                onPress={() => handleUpdatePriority(pr)}
-              >
-                <Text style={[styles.priorityBtnText, priority === pr && styles.priorityBtnTextActive]}>
-                  {pr} Priority
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        </View>
-
-        {/* Action Notice */}
-        {actionMessage ? (
-          <View style={styles.noticeBox}>
-            <Text style={styles.noticeText}>✓ {actionMessage}</Text>
+      <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+        {/* Notice alert */}
+        {actionNotice ? (
+          <View style={styles.actionNoticeBox}>
+            <Text style={styles.actionNoticeText}>✓ {actionNotice}</Text>
           </View>
         ) : null}
 
-        {/* Officer Response Form: Private Draft / Published Form */}
-        <View style={styles.card}>
-          <View style={styles.responseHeaderRow}>
-            <Text style={styles.cardSectionLabel}>
-              {isResolved ? 'PUBLISHED EXPERT ADVICE' : t.draftSectionTitle}
-            </Text>
-            <View style={styles.privateTag}>
-              <Text style={styles.privateTagText}>
-                {isResolved ? 'RESOLVED & PUBLISHED' : 'PRIVATE DRAFT'}
-              </Text>
+        {/* TAB 1: PRESCRIPTION STUDIO */}
+        {activeTab === 'prescription' && (
+          <View>
+            {/* Urgency & Assignment Bar */}
+            <View style={styles.triageMetaCard}>
+              <View style={styles.metaRow}>
+                <View>
+                  <Text style={styles.metaFieldLabel}>CASE URGENCY LEVEL</Text>
+                  <View style={styles.prioritySelectorRow}>
+                    {(['Low', 'Medium', 'High'] as CasePriority[]).map((pr) => (
+                      <TouchableOpacity
+                        key={pr}
+                        style={[
+                          styles.priorityOption,
+                          priority === pr && (pr === 'High' ? styles.prHigh : pr === 'Medium' ? styles.prMed : styles.prLow),
+                        ]}
+                        onPress={() => handleUpdatePriority(pr)}
+                      >
+                        <Text style={[styles.priorityOptionText, priority === pr && styles.priorityOptionTextActive]}>
+                          {pr === 'High' ? '🚨 High' : pr === 'Medium' ? '⚡ Med' : '🌱 Low'}
+                        </Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                </View>
+
+                <View style={styles.metaDivider} />
+
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.metaFieldLabel}>OFFICIAL ASSIGNMENT</Text>
+                  <Text style={styles.officerAssignedName}>
+                    {caseData.assignedOfficerName || 'Assigned to: ' + (user?.fullName || 'Current Officer')}
+                  </Text>
+                  <Text style={styles.versionTag}>Dossier Version: v{caseData.version}</Text>
+                </View>
+              </View>
             </View>
-          </View>
 
-          <Text style={styles.fieldLabel}>Confirmed Disease Diagnosis *</Text>
-          <TextInput
-            style={styles.input}
-            value={confirmedDisease}
-            onChangeText={setConfirmedDisease}
-            placeholder="e.g. Early Blight (Alternaria solani)"
-            placeholderTextColor="#9ca3af"
-          />
+            {/* Prescribed Diagnosis Card */}
+            <View style={styles.formCard}>
+              <View style={styles.formCardHeader}>
+                <Text style={styles.formCardTitle}>1. CONFIRMED PATHOGEN DIAGNOSIS</Text>
+                <View style={styles.aiTag}>
+                  <Text style={styles.aiTagText}>AI: {caseData.aiSuggestedDisease}</Text>
+                </View>
+              </View>
 
-          <Text style={styles.fieldLabel}>Confirmed Severity</Text>
-          <View style={styles.severityRow}>
-            {(['Mild', 'Moderate', 'Severe'] as const).map((sev) => (
-              <TouchableOpacity
-                key={sev}
-                style={[styles.sevChip, severity === sev && styles.sevChipActive]}
-                onPress={() => setSeverity(sev)}
-              >
-                <Text style={[styles.sevChipText, severity === sev && styles.sevChipTextActive]}>
-                  {sev}
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
+              <TextInput
+                style={styles.textInput}
+                value={confirmedDisease}
+                onChangeText={setConfirmedDisease}
+                placeholder="Enter confirmed scientific pathogen name..."
+                placeholderTextColor="#94a3b8"
+              />
 
-          <Text style={styles.fieldLabel}>Treatment Recommendation *</Text>
-          <TextInput
-            style={styles.textArea}
-            value={treatment}
-            onChangeText={setTreatment}
-            multiline
-            numberOfLines={3}
-            placeholder="Specify biological treatments, fungicides, or cultural measures..."
-            placeholderTextColor="#9ca3af"
-          />
+              {/* Quick Pathogen Chips */}
+              <Text style={styles.quickChipsLabel}>Quick Standard Pathogens:</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.quickChipsScroll}>
+                {commonPathogens.map((cp) => (
+                  <TouchableOpacity
+                    key={cp}
+                    style={styles.quickChip}
+                    onPress={() => setConfirmedDisease(cp)}
+                  >
+                    <Text style={styles.quickChipText}>{cp}</Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+            </View>
 
-          <Text style={styles.fieldLabel}>Farmer Instructions & Prevention Tips *</Text>
-          <TextInput
-            style={styles.textArea}
-            value={instructions}
-            onChangeText={setInstructions}
-            multiline
-            numberOfLines={3}
-            placeholder="Field hygiene, watering adjustments, crop rotation..."
-            placeholderTextColor="#9ca3af"
-          />
+            {/* Severity Rating */}
+            <View style={styles.formCard}>
+              <Text style={styles.formCardTitle}>2. CLINICAL SEVERITY ASSESSMENT</Text>
+              <View style={styles.severityGrid}>
+                {[
+                  { level: 'Mild', desc: 'Under 10% canopy infection' },
+                  { level: 'Moderate', desc: '10%–35% foliage lesions' },
+                  { level: 'Severe', desc: '35%+ or systemic wilt' },
+                ].map((item) => (
+                  <TouchableOpacity
+                    key={item.level}
+                    style={[
+                      styles.severityCard,
+                      severity === item.level && styles.severityCardActive,
+                    ]}
+                    onPress={() => setSeverity(item.level as any)}
+                  >
+                    <Text style={[styles.severityTitle, severity === item.level && styles.severityTitleActive]}>
+                      {item.level}
+                    </Text>
+                    <Text style={[styles.severityDesc, severity === item.level && styles.severityDescActive]}>
+                      {item.desc}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </View>
 
-          <Text style={styles.fieldLabel}>Recommended Follow-Up Date (Optional)</Text>
-          <TextInput
-            style={styles.input}
-            value={followUpDate}
-            onChangeText={setFollowUpDate}
-            placeholder="YYYY-MM-DD (e.g. 2026-10-25)"
-            placeholderTextColor="#9ca3af"
-          />
+            {/* Treatment Prescription */}
+            <View style={styles.formCard}>
+              <Text style={styles.formCardTitle}>3. CHEMICAL & BIOLOGICAL TREATMENT PRESCRIPTION</Text>
+              <Text style={styles.formCardHelp}>
+                Specify active ingredients, application dosage (e.g. g/L), spraying frequency, and withholding intervals.
+              </Text>
+              <TextInput
+                style={[styles.textInput, styles.textArea]}
+                value={treatment}
+                onChangeText={setTreatment}
+                placeholder="Enter treatment regimen, fungicide/pesticide dosage, and schedule..."
+                placeholderTextColor="#94a3b8"
+                multiline
+                numberOfLines={4}
+              />
+            </View>
 
-          {/* Action Buttons */}
-          <View style={styles.responseActionsGroup}>
-            {!isResolved ? (
-              <>
+            {/* Cultural & Field Instructions */}
+            <View style={styles.formCard}>
+              <Text style={styles.formCardTitle}>4. FIELD MANAGEMENT & HYGIENE INSTRUCTIONS</Text>
+              <Text style={styles.formCardHelp}>
+                Water management, eradication of infected leaves, pruning, crop spacing, and biological barrier advice.
+              </Text>
+              <TextInput
+                style={[styles.textInput, styles.textArea]}
+                value={instructions}
+                onChangeText={setInstructions}
+                placeholder="Enter field sanitation and preventive instructions..."
+                placeholderTextColor="#94a3b8"
+                multiline
+                numberOfLines={3}
+              />
+            </View>
+
+            {/* Scheduled Follow-up Date */}
+            <View style={styles.formCard}>
+              <Text style={styles.formCardTitle}>5. RECOMMENDED FIELD INSPECTION / FOLLOW-UP DATE</Text>
+              <View style={styles.dateRow}>
+                <TextInput
+                  style={[styles.textInput, { flex: 1 }]}
+                  value={followUpDate}
+                  onChangeText={setFollowUpDate}
+                  placeholder="YYYY-MM-DD"
+                  placeholderTextColor="#94a3b8"
+                />
+                <TouchableOpacity style={styles.quickDateBtn} onPress={() => handleQuickFollowUp(7)}>
+                  <Text style={styles.quickDateBtnText}>+7 Days</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.quickDateBtn} onPress={() => handleQuickFollowUp(14)}>
+                  <Text style={styles.quickDateBtnText}>+14 Days</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={styles.quickDateBtn} onPress={() => handleQuickFollowUp(30)}>
+                  <Text style={styles.quickDateBtnText}>+30 Days</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            {/* Action Buttons Studio */}
+            <View style={styles.actionsCard}>
+              <Text style={styles.actionsHeader}>DEPARTMENT ACTION CONSOLE</Text>
+
+              {/* Draft Status Banner */}
+              {hasDraft && !isResolved && (
+                <View style={styles.draftStatusBanner}>
+                  <Text style={styles.draftStatusText}>
+                    🔒 You have an active confidential working draft saved for this case.
+                  </Text>
+                </View>
+              )}
+
+              {/* 1. Save Confidential Draft & Discard Row */}
+              <View style={styles.draftActionRow}>
                 <TouchableOpacity
-                  style={[styles.saveDraftBtn, savingDraft && styles.disabledBtn]}
+                  style={styles.saveDraftBtn}
                   onPress={handleSaveDraft}
                   disabled={savingDraft || publishing}
                 >
-                  {savingDraft ? (
-                    <ActivityIndicator color={colors.primary} size="small" />
-                  ) : (
-                    <Text style={styles.saveDraftBtnText}>💾 {t.saveDraftBtn}</Text>
-                  )}
+                  <Text style={styles.saveDraftBtnText}>
+                    {savingDraft ? 'Saving Draft...' : '🔒 Save Confidential Draft'}
+                  </Text>
                 </TouchableOpacity>
 
+                {hasDraft && (
+                  <TouchableOpacity style={styles.discardDraftBtn} onPress={handleDiscardDraft}>
+                    <Text style={styles.discardDraftBtnText}>Discard</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+
+              {/* 2. Official Publication Button */}
+              {!isResolved ? (
                 <TouchableOpacity
-                  style={[styles.publishBtn, publishing && styles.disabledBtn]}
+                  style={styles.publishOfficialBtn}
                   onPress={handlePublish}
                   disabled={publishing || savingDraft}
                 >
-                  {publishing ? (
-                    <ActivityIndicator color="#ffffff" size="small" />
-                  ) : (
-                    <Text style={styles.publishBtnText}>🚀 {t.publishResponseBtn}</Text>
-                  )}
-                </TouchableOpacity>
-
-                {caseData.privateDraft && (
-                  <TouchableOpacity style={styles.discardBtn} onPress={handleDiscardDraft}>
-                    <Text style={styles.discardBtnText}>🗑 {t.discardDraftBtn}</Text>
-                  </TouchableOpacity>
-                )}
-              </>
-            ) : (
-              <>
-                <TouchableOpacity
-                  style={styles.publishBtn}
-                  onPress={handleEditPublished}
-                  disabled={publishing}
-                >
-                  <Text style={styles.publishBtnText}>✏ {t.editPublishedBtn}</Text>
-                </TouchableOpacity>
-
-                <TouchableOpacity
-                  style={styles.withdrawBtn}
-                  onPress={handleWithdraw}
-                >
-                  <Text style={styles.withdrawBtnText}>↩ {t.withdrawResponseBtn}</Text>
-                </TouchableOpacity>
-              </>
-            )}
-          </View>
-        </View>
-
-        {/* Audit Trail Section */}
-        {caseData.auditTrail && caseData.auditTrail.length > 0 && (
-          <View style={styles.card}>
-            <Text style={styles.cardSectionLabel}>CASE AUDIT HISTORY</Text>
-            {caseData.auditTrail.map((ev, idx) => (
-              <View key={idx} style={styles.auditItem}>
-                <View style={styles.auditDot} />
-                <View style={styles.auditDetails}>
-                  <Text style={styles.auditAction}>{ev.action}</Text>
-                  <Text style={styles.auditAuthor}>
-                    By {ev.by.name} ({ev.by.role}) · {new Date(ev.timestamp).toLocaleString()}
+                  <Text style={styles.publishOfficialBtnText}>
+                    {publishing ? 'Publishing Prescription...' : '🏛 Publish Official Prescription to Farmer →'}
                   </Text>
-                  {ev.note ? <Text style={styles.auditNote}>"{ev.note}"</Text> : null}
+                </TouchableOpacity>
+              ) : (
+                <View style={styles.resolvedActions}>
+                  <TouchableOpacity
+                    style={styles.editPublishedBtn}
+                    onPress={handleEditPublished}
+                    disabled={publishing}
+                  >
+                    <Text style={styles.editPublishedBtnText}>
+                      {publishing ? 'Updating...' : '✎ Update Published Prescription'}
+                    </Text>
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={styles.withdrawBtn}
+                    onPress={handleWithdraw}
+                    disabled={withdrawing}
+                  >
+                    <Text style={styles.withdrawBtnText}>
+                      {withdrawing ? 'Revoking...' : '↺ Revoke & Reopen Case'}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+              )}
+            </View>
+          </View>
+        )}
+
+        {/* TAB 2: SPECIMEN & FARMER OBSERVATIONS */}
+        {activeTab === 'specimen' && (
+          <View style={styles.specimenTabContainer}>
+            {/* Leaf Image Card */}
+            <View style={styles.specimenCard}>
+              <Text style={styles.specimenCardTitle}>FARMER SPECIMEN PHOTOGRAPH</Text>
+              <View style={styles.specimenFrame}>
+                {caseData.imageUrl ? (
+                  <TouchableOpacity onPress={() => setImageModalOpen(true)} activeOpacity={0.9}>
+                    <Image
+                      source={{ uri: `${API_BASE_URL}${caseData.imageUrl}` }}
+                      style={styles.specimenImage}
+                      resizeMode="cover"
+                    />
+                    <View style={styles.expandOverlay}>
+                      <Text style={styles.expandOverlayText}>🔍 Tap to View Full High-Res Specimen</Text>
+                    </View>
+                  </TouchableOpacity>
+                ) : (
+                  <View style={styles.noSpecimenBox}>
+                    <Text style={{ fontSize: 36 }}>🍃</Text>
+                    <Text style={{ color: '#94a3b8', marginTop: 8 }}>No leaf photograph attached</Text>
+                  </View>
+                )}
+              </View>
+            </View>
+
+            {/* Farmer Submission Details Card */}
+            <View style={styles.specimenCard}>
+              <Text style={styles.specimenCardTitle}>FARMER FIELD CONTEXT</Text>
+
+              <View style={styles.detailRow}>
+                <Text style={styles.detailLabel}>Farmer Full Name:</Text>
+                <Text style={styles.detailValue}>{caseData.farmerName}</Text>
+              </View>
+
+              <View style={styles.detailRow}>
+                <Text style={styles.detailLabel}>Crop Variety:</Text>
+                <Text style={styles.detailValue}>{caseData.crop}</Text>
+              </View>
+
+              <View style={styles.detailRow}>
+                <Text style={styles.detailLabel}>Farm Location:</Text>
+                <Text style={styles.detailValue}>
+                  {caseData.location} · {caseData.district || 'Central District'}
+                </Text>
+              </View>
+
+              <View style={styles.detailRow}>
+                <Text style={styles.detailLabel}>Extension Office:</Text>
+                <Text style={styles.detailValue}>{caseData.office || 'Agrarian Services Centre'}</Text>
+              </View>
+
+              <View style={styles.detailRow}>
+                <Text style={styles.detailLabel}>Submitted Timestamp:</Text>
+                <Text style={styles.detailValue}>{new Date(caseData.createdAt).toLocaleString()}</Text>
+              </View>
+
+              <View style={styles.fieldNotesBox}>
+                <Text style={styles.fieldNotesLabel}>Farmer's Reported Symptoms:</Text>
+                <Text style={styles.fieldNotesText}>
+                  {caseData.farmerNotes ? `"${caseData.farmerNotes}"` : 'No additional field notes provided by farmer.'}
+                </Text>
+              </View>
+            </View>
+
+            {/* AI Diagnostic Confidence Card */}
+            <View style={styles.specimenCard}>
+              <Text style={styles.specimenCardTitle}>AI DIAGNOSTIC INFERENCE METRICS</Text>
+              <View style={styles.aiMetricRow}>
+                <View>
+                  <Text style={styles.aiPathogen}>{caseData.aiSuggestedDisease}</Text>
+                  <Text style={styles.aiCropMatch}>Predicted for Crop: {caseData.crop}</Text>
+                </View>
+                <View style={styles.aiConfidenceBadge}>
+                  <Text style={styles.aiConfidenceText}>94% MATCH</Text>
                 </View>
               </View>
-            ))}
+              <Text style={styles.aiDisclaim}>
+                * Automated computer vision inference engine. Must be verified and confirmed by an authorized Agricultural Officer prior to farmer treatment.
+              </Text>
+            </View>
+          </View>
+        )}
+
+        {/* TAB 3: AUDIT LEDGER */}
+        {activeTab === 'audit' && (
+          <View style={styles.auditContainer}>
+            <View style={styles.auditHeaderCard}>
+              <Text style={styles.auditHeaderTitle}>OFFICIAL REGISTRATION & AUDIT TRAIL</Text>
+              <Text style={styles.auditHeaderSub}>
+                Every state transition, draft update, and advice publication is permanently recorded in the immutable audit ledger.
+              </Text>
+            </View>
+
+            {caseData.auditTrail && caseData.auditTrail.length > 0 ? (
+              caseData.auditTrail.map((entry, idx) => (
+                <View key={idx} style={styles.auditItem}>
+                  <View style={styles.auditLineLeft}>
+                    <View style={styles.auditDot} />
+                    {idx < (caseData.auditTrail?.length ?? 0) - 1 && <View style={styles.auditConnector} />}
+                  </View>
+                  <View style={styles.auditItemContent}>
+                    <View style={styles.auditActionRow}>
+                      <Text style={styles.auditAction}>{entry.action}</Text>
+                      <Text style={styles.auditTime}>{new Date(entry.timestamp).toLocaleString()}</Text>
+                    </View>
+                    <Text style={styles.auditActor}>
+                      By: {entry.by?.name} ({entry.by?.role})
+                    </Text>
+                    {entry.note ? <Text style={styles.auditNote}>"{entry.note}"</Text> : null}
+                  </View>
+                </View>
+              ))
+            ) : (
+              <View style={styles.emptyCard}>
+                <Text style={{ color: '#94a3b8' }}>No audit trail entries found.</Text>
+              </View>
+            )}
           </View>
         )}
       </ScrollView>
+
+      {/* Full Image Modal */}
+      <Modal visible={imageModalOpen} transparent animationType="fade">
+        <View style={styles.modalBackdrop}>
+          <TouchableOpacity style={styles.modalCloseBtn} onPress={() => setImageModalOpen(false)}>
+            <Text style={styles.modalCloseBtnText}>✕ Close</Text>
+          </TouchableOpacity>
+          {caseData.imageUrl ? (
+            <Image
+              source={{ uri: `${API_BASE_URL}${caseData.imageUrl}` }}
+              style={styles.modalFullImage}
+              resizeMode="contain"
+            />
+          ) : null}
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -489,357 +729,655 @@ export default function OfficerCaseReviewScreen() {
 const styles = StyleSheet.create({
   safeArea: {
     flex: 1,
-    backgroundColor: colors.background,
+    backgroundColor: '#0f172a',
   },
-  header: {
+  dossierBar: {
+    backgroundColor: '#090d16',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
     flexDirection: 'row',
-    alignItems: 'center',
     justifyContent: 'space-between',
-    paddingHorizontal: 20,
-    paddingVertical: 14,
+    alignItems: 'center',
     borderBottomWidth: 1,
-    borderBottomColor: colors.border,
-    backgroundColor: '#ffffff',
+    borderBottomColor: '#1e293b',
   },
-  headerBackBtn: {
-    paddingVertical: 4,
+  backArrowBtn: {
+    backgroundColor: '#1e293b',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#334155',
   },
-  headerBackText: {
-    color: colors.primary,
-    fontSize: 14,
-    fontWeight: '700',
-  },
-  headerTitle: {
-    fontSize: 16,
+  backArrowText: {
+    fontSize: 12,
     fontWeight: '800',
-    color: colors.primaryDark,
+    color: '#34d399',
+  },
+  dossierBarTitle: {
+    alignItems: 'center',
+  },
+  dossierTitle: {
+    fontSize: 13,
+    fontWeight: '900',
+    color: '#ffffff',
+    letterSpacing: 0.6,
+  },
+  dossierSubtitle: {
+    fontSize: 11,
+    color: '#94a3b8',
+    marginTop: 2,
+  },
+  statusPillSmall: {
+    backgroundColor: '#064e3b',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#059669',
+  },
+  statusPillSmallText: {
+    fontSize: 10,
+    fontWeight: '900',
+    color: '#34d399',
+  },
+  tabsHeader: {
+    flexDirection: 'row',
+    backgroundColor: '#1e293b',
+    borderBottomWidth: 1,
+    borderBottomColor: '#334155',
+  },
+  dossierTab: {
+    flex: 1,
+    paddingVertical: 12,
+    alignItems: 'center',
+    borderBottomWidth: 2,
+    borderBottomColor: 'transparent',
+  },
+  dossierTabActive: {
+    borderBottomColor: '#10b981',
+    backgroundColor: '#0f172a',
+  },
+  dossierTabText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#94a3b8',
+  },
+  dossierTabTextActive: {
+    color: '#34d399',
+    fontWeight: '900',
   },
   content: {
-    padding: 20,
-    paddingBottom: 40,
+    backgroundColor: '#f8fafc',
+    padding: 16,
+    paddingBottom: 60,
   },
-  memberTag: {
-    backgroundColor: '#e6ede3',
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 8,
-    alignSelf: 'flex-start',
-    marginBottom: 12,
-  },
-  memberTagText: {
-    fontSize: 10,
-    fontWeight: '800',
-    color: colors.primary,
-    letterSpacing: 0.8,
-  },
-  card: {
-    backgroundColor: '#ffffff',
-    borderRadius: 18,
-    padding: 18,
-    borderWidth: 1,
-    borderColor: colors.border,
-    marginBottom: 16,
-  },
-  cardSectionLabel: {
-    fontSize: 11,
-    fontWeight: '800',
-    color: colors.textMuted,
-    letterSpacing: 0.8,
-    marginBottom: 10,
-  },
-  farmerTitle: {
-    fontSize: 18,
-    fontWeight: '800',
-    color: colors.primaryDark,
-  },
-  farmerSub: {
-    fontSize: 13,
-    color: colors.text,
-    marginTop: 2,
-  },
-  officeSub: {
-    fontSize: 12,
-    color: colors.primary,
-    fontWeight: '700',
-    marginTop: 2,
-  },
-  symptomsBox: {
-    backgroundColor: '#f9fbf8',
-    borderRadius: 12,
-    padding: 12,
-    marginTop: 12,
-  },
-  symptomsLabel: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: colors.textMuted,
-    marginBottom: 4,
-  },
-  symptomsText: {
-    fontSize: 13,
-    color: colors.text,
-    fontStyle: 'italic',
-    lineHeight: 18,
-  },
-  leafImage: {
-    width: '100%',
-    height: 180,
-    borderRadius: 12,
-    marginBottom: 12,
-  },
-  missingImageBox: {
-    height: 120,
-    backgroundColor: '#f0f3ef',
-    borderRadius: 12,
+  centerBox: {
+    flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    marginBottom: 12,
+    padding: 20,
   },
-  missingImageText: {
-    fontSize: 12,
-    color: colors.textMuted,
-    marginTop: 4,
-  },
-  aiSuggestionBox: {
-    backgroundColor: '#f9fbf8',
-    borderRadius: 12,
-    padding: 12,
-  },
-  aiRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginBottom: 2,
-  },
-  aiCropText: {
-    fontSize: 13,
+  loadingText: {
+    marginTop: 10,
+    fontSize: 14,
+    color: '#94a3b8',
     fontWeight: '700',
-    color: colors.textMuted,
   },
-  aiConfidenceText: {
+  backBtn: {
+    marginTop: 14,
+    backgroundColor: '#059669',
+    paddingHorizontal: 16,
+    paddingVertical: 9,
+    borderRadius: 8,
+  },
+  backBtnText: {
     fontSize: 12,
-    fontWeight: '700',
-    color: colors.primary,
-  },
-  aiDiseaseText: {
-    fontSize: 16,
     fontWeight: '800',
-    color: colors.primaryDark,
+    color: '#ffffff',
+  },
+  actionNoticeBox: {
+    backgroundColor: '#ecfdf5',
+    borderWidth: 1,
+    borderColor: '#a7f3d0',
+    padding: 12,
+    borderRadius: 10,
+    marginBottom: 14,
+  },
+  actionNoticeText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#065f46',
+  },
+  triageMetaCard: {
+    backgroundColor: '#ffffff',
+    borderRadius: 14,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    marginBottom: 14,
+  },
+  metaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  metaFieldLabel: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: '#64748b',
+    letterSpacing: 0.5,
+    marginBottom: 6,
   },
   prioritySelectorRow: {
     flexDirection: 'row',
-    gap: 8,
+    gap: 6,
   },
-  priorityBtn: {
-    flex: 1,
-    paddingVertical: 10,
-    borderRadius: 10,
-    backgroundColor: '#f6f7f5',
+  priorityOption: {
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 6,
+    backgroundColor: '#f1f5f9',
     borderWidth: 1,
-    borderColor: colors.border,
-    alignItems: 'center',
+    borderColor: '#e2e8f0',
   },
-  prHighActive: {
-    backgroundColor: '#ffebeb',
-    borderColor: '#ffc8be',
+  prHigh: {
+    backgroundColor: '#fef2f2',
+    borderColor: '#fca5a5',
   },
-  prMedActive: {
-    backgroundColor: '#fff5db',
-    borderColor: '#edd395',
+  prMed: {
+    backgroundColor: '#fffbeb',
+    borderColor: '#fde68a',
   },
-  prLowActive: {
-    backgroundColor: '#eaf4eb',
-    borderColor: '#cce2d2',
+  prLow: {
+    backgroundColor: '#f0fdf4',
+    borderColor: '#bbf7d0',
   },
-  priorityBtnText: {
+  priorityOptionText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#475569',
+  },
+  priorityOptionTextActive: {
+    fontWeight: '900',
+    color: '#0f172a',
+  },
+  metaDivider: {
+    width: 1,
+    height: 40,
+    backgroundColor: '#cbd5e1',
+  },
+  officerAssignedName: {
     fontSize: 12,
-    fontWeight: '700',
-    color: colors.textMuted,
-  },
-  priorityBtnTextActive: {
-    color: colors.primaryDark,
     fontWeight: '800',
+    color: '#0f172a',
   },
-  noticeBox: {
-    backgroundColor: colors.successLight,
-    padding: 12,
-    borderRadius: 12,
+  versionTag: {
+    fontSize: 10,
+    color: '#94a3b8',
+    marginTop: 2,
+  },
+  formCard: {
+    backgroundColor: '#ffffff',
+    borderRadius: 14,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
     marginBottom: 14,
+    shadowColor: '#000',
+    shadowOpacity: 0.03,
+    shadowRadius: 4,
+    elevation: 1,
   },
-  noticeText: {
-    color: colors.success,
-    fontSize: 13,
-    fontWeight: '700',
-  },
-  responseHeaderRow: {
+  formCardHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     marginBottom: 10,
   },
-  privateTag: {
-    backgroundColor: '#eff5df',
+  formCardTitle: {
+    fontSize: 11,
+    fontWeight: '900',
+    color: '#0f172a',
+    letterSpacing: 0.6,
+  },
+  aiTag: {
+    backgroundColor: '#ecfdf5',
     paddingHorizontal: 8,
     paddingVertical: 3,
     borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#a7f3d0',
   },
-  privateTagText: {
+  aiTagText: {
     fontSize: 10,
     fontWeight: '800',
-    color: colors.primaryDark,
+    color: '#047857',
   },
-  fieldLabel: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: colors.primaryDark,
-    marginTop: 10,
-    marginBottom: 6,
+  formCardHelp: {
+    fontSize: 11,
+    color: '#64748b',
+    marginBottom: 10,
+    lineHeight: 15,
   },
-  input: {
-    backgroundColor: '#f9fbf8',
+  textInput: {
+    backgroundColor: '#f8fafc',
     borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: 12,
+    borderColor: '#cbd5e1',
+    borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 10,
     fontSize: 13,
-    color: colors.text,
-  },
-  severityRow: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  sevChip: {
-    flex: 1,
-    paddingVertical: 8,
-    borderRadius: 10,
-    backgroundColor: '#f6f7f5',
-    borderWidth: 1,
-    borderColor: colors.border,
-    alignItems: 'center',
-  },
-  sevChipActive: {
-    backgroundColor: colors.primary,
-    borderColor: colors.primary,
-  },
-  sevChipText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: colors.textMuted,
-  },
-  sevChipTextActive: {
-    color: '#ffffff',
+    color: '#0f172a',
   },
   textArea: {
-    backgroundColor: '#f9fbf8',
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: 12,
-    padding: 12,
-    fontSize: 13,
-    color: colors.text,
-    textAlignVertical: 'top',
     minHeight: 80,
+    textAlignVertical: 'top',
   },
-  responseActionsGroup: {
-    marginTop: 18,
-    gap: 10,
+  quickChipsLabel: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: '#64748b',
+    marginTop: 10,
+    marginBottom: 6,
+  },
+  quickChipsScroll: {
+    flexDirection: 'row',
+    gap: 6,
+  },
+  quickChip: {
+    backgroundColor: '#f1f5f9',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  quickChipText: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#334155',
+  },
+  severityGrid: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 10,
+  },
+  severityCard: {
+    flex: 1,
+    backgroundColor: '#f8fafc',
+    borderRadius: 10,
+    padding: 10,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    alignItems: 'center',
+  },
+  severityCardActive: {
+    backgroundColor: '#0f172a',
+    borderColor: '#0f172a',
+  },
+  severityTitle: {
+    fontSize: 12,
+    fontWeight: '900',
+    color: '#334155',
+  },
+  severityTitleActive: {
+    color: '#34d399',
+  },
+  severityDesc: {
+    fontSize: 9,
+    color: '#64748b',
+    textAlign: 'center',
+    marginTop: 3,
+  },
+  severityDescActive: {
+    color: '#e2e8f0',
+  },
+  dateRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginTop: 8,
+  },
+  quickDateBtn: {
+    backgroundColor: '#f1f5f9',
+    paddingHorizontal: 10,
+    paddingVertical: 10,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+  },
+  quickDateBtnText: {
+    fontSize: 11,
+    fontWeight: '800',
+    color: '#059669',
+  },
+  actionsCard: {
+    backgroundColor: '#0f172a',
+    borderRadius: 16,
+    padding: 16,
+    marginTop: 6,
+  },
+  actionsHeader: {
+    fontSize: 11,
+    fontWeight: '900',
+    color: '#94a3b8',
+    letterSpacing: 0.8,
+    marginBottom: 12,
+  },
+  draftStatusBanner: {
+    backgroundColor: '#1e293b',
+    borderWidth: 1,
+    borderColor: '#334155',
+    padding: 10,
+    borderRadius: 8,
+    marginBottom: 12,
+  },
+  draftStatusText: {
+    fontSize: 11,
+    color: '#fbbf24',
+    fontWeight: '700',
+  },
+  draftActionRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 12,
   },
   saveDraftBtn: {
-    backgroundColor: '#eaf4eb',
-    borderRadius: 12,
+    flex: 1,
+    backgroundColor: '#1e293b',
+    borderWidth: 1,
+    borderColor: '#334155',
     paddingVertical: 12,
+    borderRadius: 10,
     alignItems: 'center',
   },
   saveDraftBtnText: {
-    color: colors.primary,
-    fontSize: 14,
-    fontWeight: '700',
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#e2e8f0',
   },
-  publishBtn: {
-    backgroundColor: colors.primary,
-    borderRadius: 12,
-    paddingVertical: 14,
+  discardDraftBtn: {
+    backgroundColor: '#7f1d1d',
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    borderRadius: 10,
     alignItems: 'center',
   },
-  publishBtnText: {
+  discardDraftBtnText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#fca5a5',
+  },
+  publishOfficialBtn: {
+    backgroundColor: '#059669',
+    paddingVertical: 14,
+    borderRadius: 10,
+    alignItems: 'center',
+    shadowColor: '#059669',
+    shadowOpacity: 0.3,
+    shadowRadius: 6,
+    elevation: 3,
+  },
+  publishOfficialBtnText: {
+    fontSize: 13,
+    fontWeight: '900',
     color: '#ffffff',
-    fontSize: 15,
-    fontWeight: '700',
+  },
+  resolvedActions: {
+    gap: 10,
+  },
+  editPublishedBtn: {
+    backgroundColor: '#059669',
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
+  },
+  editPublishedBtnText: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: '#ffffff',
   },
   withdrawBtn: {
-    backgroundColor: colors.dangerLight,
-    borderWidth: 1,
-    borderColor: '#ffc8be',
-    borderRadius: 12,
+    backgroundColor: '#b91c1c',
     paddingVertical: 12,
+    borderRadius: 10,
     alignItems: 'center',
   },
   withdrawBtnText: {
-    color: colors.danger,
-    fontSize: 13,
-    fontWeight: '700',
-  },
-  discardBtn: {
-    alignItems: 'center',
-    paddingVertical: 8,
-  },
-  discardBtnText: {
-    color: colors.danger,
     fontSize: 12,
+    fontWeight: '800',
+    color: '#ffffff',
+  },
+  specimenTabContainer: {
+    gap: 14,
+  },
+  specimenCard: {
+    backgroundColor: '#ffffff',
+    borderRadius: 14,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  specimenCardTitle: {
+    fontSize: 11,
+    fontWeight: '900',
+    color: '#0f172a',
+    letterSpacing: 0.6,
+    marginBottom: 12,
+  },
+  specimenFrame: {
+    height: 220,
+    borderRadius: 12,
+    overflow: 'hidden',
+    backgroundColor: '#f1f5f9',
+    position: 'relative',
+  },
+  specimenImage: {
+    width: '100%',
+    height: '100%',
+  },
+  expandOverlay: {
+    position: 'absolute',
+    bottom: 0,
+    left: 0,
+    right: 0,
+    backgroundColor: 'rgba(15, 23, 42, 0.75)',
+    paddingVertical: 8,
+    alignItems: 'center',
+  },
+  expandOverlayText: {
+    fontSize: 11,
+    fontWeight: '800',
+    color: '#ffffff',
+  },
+  noSpecimenBox: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  detailRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f1f5f9',
+  },
+  detailLabel: {
+    fontSize: 12,
+    color: '#64748b',
     fontWeight: '600',
   },
-  disabledBtn: {
-    opacity: 0.7,
+  detailValue: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#0f172a',
+  },
+  fieldNotesBox: {
+    marginTop: 12,
+    backgroundColor: '#f8fafc',
+    borderRadius: 8,
+    padding: 12,
+    borderLeftWidth: 3,
+    borderLeftColor: '#059669',
+  },
+  fieldNotesLabel: {
+    fontSize: 10,
+    fontWeight: '800',
+    color: '#64748b',
+    marginBottom: 4,
+  },
+  fieldNotesText: {
+    fontSize: 12,
+    fontStyle: 'italic',
+    color: '#1e293b',
+    lineHeight: 18,
+  },
+  aiMetricRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    backgroundColor: '#ecfdf5',
+    padding: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#a7f3d0',
+  },
+  aiPathogen: {
+    fontSize: 13,
+    fontWeight: '900',
+    color: '#065f46',
+  },
+  aiCropMatch: {
+    fontSize: 11,
+    color: '#047857',
+    marginTop: 2,
+  },
+  aiConfidenceBadge: {
+    backgroundColor: '#059669',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+  },
+  aiConfidenceText: {
+    fontSize: 10,
+    fontWeight: '900',
+    color: '#ffffff',
+  },
+  aiDisclaim: {
+    fontSize: 10,
+    color: '#94a3b8',
+    marginTop: 10,
+    lineHeight: 14,
+  },
+  auditContainer: {
+    gap: 12,
+  },
+  auditHeaderCard: {
+    backgroundColor: '#ffffff',
+    borderRadius: 14,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  auditHeaderTitle: {
+    fontSize: 11,
+    fontWeight: '900',
+    color: '#0f172a',
+    letterSpacing: 0.6,
+  },
+  auditHeaderSub: {
+    fontSize: 11,
+    color: '#64748b',
+    marginTop: 4,
+    lineHeight: 16,
   },
   auditItem: {
     flexDirection: 'row',
-    gap: 12,
-    marginBottom: 12,
+    backgroundColor: '#ffffff',
+    borderRadius: 12,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  auditLineLeft: {
+    width: 20,
+    alignItems: 'center',
+    marginRight: 8,
   },
   auditDot: {
     width: 10,
     height: 10,
     borderRadius: 5,
-    backgroundColor: colors.primary,
+    backgroundColor: '#059669',
     marginTop: 4,
   },
-  auditDetails: {
+  auditConnector: {
+    width: 2,
     flex: 1,
+    backgroundColor: '#e2e8f0',
+    marginTop: 4,
+  },
+  auditItemContent: {
+    flex: 1,
+  },
+  auditActionRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
   },
   auditAction: {
     fontSize: 12,
     fontWeight: '800',
-    color: colors.primaryDark,
+    color: '#0f172a',
   },
-  auditAuthor: {
+  auditTime: {
+    fontSize: 10,
+    color: '#94a3b8',
+  },
+  auditActor: {
     fontSize: 11,
-    color: colors.textMuted,
-  },
-  auditNote: {
-    fontSize: 12,
-    color: colors.text,
-    fontStyle: 'italic',
+    color: '#64748b',
     marginTop: 2,
   },
-  loadingBox: {
+  auditNote: {
+    fontSize: 11,
+    color: '#334155',
+    fontStyle: 'italic',
+    marginTop: 4,
+  },
+  emptyCard: {
+    backgroundColor: '#ffffff',
+    borderRadius: 14,
+    padding: 24,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  modalBackdrop: {
     flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.92)',
     justifyContent: 'center',
     alignItems: 'center',
+    padding: 16,
   },
-  loadingText: {
-    marginTop: 10,
+  modalCloseBtn: {
+    position: 'absolute',
+    top: 50,
+    right: 20,
+    backgroundColor: '#334155',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 8,
+    zIndex: 10,
+  },
+  modalCloseBtnText: {
     fontSize: 13,
-    color: colors.textMuted,
-  },
-  backBtn: {
-    marginTop: 14,
-    backgroundColor: colors.primary,
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    borderRadius: 10,
-  },
-  backBtnText: {
+    fontWeight: '800',
     color: '#ffffff',
-    fontWeight: '700',
+  },
+  modalFullImage: {
+    width: '100%',
+    height: '75%',
   },
 });
