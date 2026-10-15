@@ -8,8 +8,9 @@
     "userInterfaceStyle": "light",
     "scheme": "cropcare",
     "splash": {
-      "backgroundColor": "#196448",
-      "resizeMode": "contain"
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#196448"
     },
     "ios": {
       "supportsTablet": true,
@@ -21,6 +22,7 @@
     },
     "android": {
       "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#196448"
       },
       "package": "com.we178.cropcare",
